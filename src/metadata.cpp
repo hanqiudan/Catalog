@@ -1411,3 +1411,287 @@ iceberg_meta_get_table_for_update(const char *namespace_name, const char *table_
 
     return info;
 }
+
+/*
+ * Update table metadata pointers and optional summary fields with optimistic locking.
+ * Uses CAS: WHERE metadata_location = old AND table_uuid check.
+ *
+ * This is an internal function; SQL functions should use the scene-level
+ * commit wrappers instead.
+ */
+void
+iceberg_meta_update_table(const char *ns, const char *tbl,
+                          const char *uuid, const char *old_meta, const char *new_meta,
+                          int64_t new_snap_id, bool has_new_snap,
+                          int new_schema_id, bool has_new_schema,
+                          int new_last_col_id, bool has_new_last_col,
+                          int new_def_spec_id, bool has_new_def_spec)
+{
+    Datum values[13];
+    Oid argtypes[13];
+    char nulls[13];
+    int rc;
+
+    validate_name(ns, "namespace_name");
+    validate_name(tbl, "table_name");
+    validate_name(uuid, "table_uuid");
+    validate_name(old_meta, "old_metadata_location");
+    validate_name(new_meta, "new_metadata_location");
+
+    argtypes[0] = TEXTOID;
+    argtypes[1] = TEXTOID;
+    argtypes[2] = TEXTOID;
+    argtypes[3] = TEXTOID;
+    argtypes[4] = INT4OID;
+    argtypes[5] = INT8OID;
+    argtypes[6] = INT4OID;
+    argtypes[7] = INT4OID;
+    argtypes[8] = INT4OID;
+    argtypes[9] = INT4OID;
+    argtypes[10] = INT4OID;
+    argtypes[11] = INT4OID;
+    argtypes[12] = TEXTOID;
+
+    values[0] = CStringGetTextDatum(ns);
+    values[1] = CStringGetTextDatum(tbl);
+    values[2] = CStringGetTextDatum(uuid);
+    values[3] = CStringGetTextDatum(new_meta);
+    values[4] = Int32GetDatum(has_new_snap ? 1 : 0);
+    values[5] = Int64GetDatum(new_snap_id);
+    values[6] = Int32GetDatum(has_new_schema ? 1 : 0);
+    values[7] = Int32GetDatum(new_schema_id);
+    values[8] = Int32GetDatum(has_new_last_col ? 1 : 0);
+    values[9] = Int32GetDatum(new_last_col_id);
+    values[10] = Int32GetDatum(has_new_def_spec ? 1 : 0);
+    values[11] = Int32GetDatum(new_def_spec_id);
+    values[12] = CStringGetTextDatum(old_meta);
+
+    /* No NULLs in bind values */
+    memset(nulls, ' ', sizeof(nulls));
+
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "UPDATE iceberg_catalog.tables_internal "
+        "SET previous_metadata_location = metadata_location, "
+        "    metadata_location = $4, "
+        "    current_snapshot_id = CASE WHEN $5::int <> 0 THEN $6::bigint ELSE current_snapshot_id END, "
+        "    current_schema_id   = CASE WHEN $7::int <> 0 THEN $8::int   ELSE current_schema_id   END, "
+        "    last_column_id      = CASE WHEN $9::int <> 0 THEN $10::int  ELSE last_column_id      END, "
+        "    default_spec_id     = CASE WHEN $11::int <> 0 THEN $12::int ELSE default_spec_id     END "
+        "WHERE namespace = $1 AND table_name = $2 "
+        "  AND table_uuid = $3::uuid "
+        "  AND metadata_location = $13 "
+        "RETURNING table_uuid::text",
+        13, argtypes, values, nulls, false, 1);
+
+    if (rc != SPI_OK_UPDATE_RETURNING)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("metadata update table query failed")));
+
+    if (SPI_processed > 0)
+        return;  /* success */
+
+    /*
+     * Zero rows updated -- diagnostic phase.  Check whether the
+     * table still exists and if the UUID matches.
+     */
+    {
+        Datum diag_values[2];
+        Oid diag_argtypes[2] = {TEXTOID, TEXTOID};
+        int diag_rc;
+
+        diag_values[0] = CStringGetTextDatum(ns);
+        diag_values[1] = CStringGetTextDatum(tbl);
+
+        diag_rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+            "SELECT table_uuid::text, metadata_location "
+            "FROM iceberg_catalog.tables_internal "
+            "WHERE namespace = $1 AND table_name = $2",
+            2, diag_argtypes, diag_values, NULL, true, 1);
+
+        if (diag_rc != SPI_OK_SELECT)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("metadata update table diagnostic query failed")));
+
+        if (SPI_processed == 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_OBJECT),
+                     errmsg("table \"%s.%s\" does not exist", ns, tbl)));
+
+        {
+            char *existing_uuid = SPI_getvalue(SPI_tuptable->vals[0],
+                                                SPI_tuptable->tupdesc, 1);
+            char *existing_meta = SPI_getvalue(SPI_tuptable->vals[0],
+                                                SPI_tuptable->tupdesc, 2);
+
+            if (existing_uuid == NULL || strcmp(existing_uuid, uuid) != 0)
+                ereport(ERROR,
+                        (errcode(ERRCODE_DUPLICATE_OBJECT),
+                         errmsg("table \"%s.%s\" UUID has changed since lock was acquired", ns, tbl)));
+
+            if (existing_meta == NULL || strcmp(existing_meta, old_meta) != 0)
+                ereport(ERROR,
+                        (errcode(ERRCODE_DUPLICATE_OBJECT),
+                         errmsg("table \"%s.%s\" metadata_location changed concurrently", ns, tbl)));
+
+            /* Both UUID and metadata_location match -- should never happen */
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("table \"%s.%s\" update failed for unknown reason", ns, tbl)));
+        }
+    }
+}
+
+/*
+ * Insert a snapshot summary row into iceberg_catalog.snapshots.
+ * Internal function; does not manage SPI.
+ */
+void
+iceberg_meta_insert_snapshot(const char *table_uuid,
+                              int64_t snapshot_id,
+                              int schema_id,
+                              bool has_schema_id,
+                              int64_t timestamp_ms,
+                              const char *manifest_list,
+                              int64_t total_records,
+                              bool has_total_records)
+{
+    Datum values[6];
+    Oid argtypes[6] = {TEXTOID, INT8OID, INT4OID, INT8OID, TEXTOID, INT8OID};
+    char nulls[6] = {' ', ' ', ' ', ' ', ' ', ' '};
+    int rc;
+
+    validate_name(table_uuid, "table_uuid");
+
+    values[0] = CStringGetTextDatum(table_uuid);
+    values[1] = Int64GetDatum(snapshot_id);
+    values[2] = Int32GetDatum(schema_id);
+    values[3] = Int64GetDatum(timestamp_ms);
+    if (manifest_list != NULL)
+        values[4] = CStringGetTextDatum(manifest_list);
+    else
+        nulls[4] = 'n';
+    values[5] = Int64GetDatum(total_records);
+
+    if (!has_schema_id)
+        nulls[2] = 'n';
+    if (!has_total_records)
+        nulls[5] = 'n';
+
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "INSERT INTO iceberg_catalog.snapshots("
+        "    table_uuid, snapshot_id, schema_id, timestamp_ms,"
+        "    manifest_list, total_records"
+        ") VALUES ("
+        "    $1::uuid, $2, $3, $4,"
+        "    $5, $6"
+        ")",
+        6, argtypes, values, nulls, false, 0);
+
+    if (rc != SPI_OK_INSERT)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("failed to insert snapshot metadata")));
+
+    if (SPI_processed != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("unexpected snapshot insert count")));
+}
+
+/*
+ * Scene-level commit: update table pointer + insert snapshot cache.
+ * This is the primary entry-point for commit_table.
+ */
+void
+iceberg_meta_commit_table(const MetaCommitTableInput *input)
+{
+    bool spi_connected = false;
+
+    if (input == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("input is required")));
+
+    validate_name(input->namespace_name, "namespace_name");
+    validate_name(input->table_name, "table_name");
+    validate_name(input->table_uuid, "table_uuid");
+    validate_name(input->old_metadata_location, "old_metadata_location");
+    validate_name(input->new_metadata_location, "new_metadata_location");
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+
+        iceberg_meta_update_table(input->namespace_name, input->table_name,
+            input->table_uuid, input->old_metadata_location, input->new_metadata_location,
+            input->new_snapshot_id, true,   /* always update snapshot_id */
+            0, false,                       /* don't update schema_id */
+            0, false,                       /* don't update last_column_id */
+            0, false);                      /* don't update default_spec_id */
+
+        iceberg_meta_insert_snapshot(input->table_uuid, input->new_snapshot_id,
+            input->snapshot_schema_id, input->has_snapshot_schema_id,
+            input->snapshot_timestamp_ms, input->manifest_list,
+            input->total_records, input->has_total_records);
+
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata commit table");
+    }
+    PG_END_TRY();
+}
+
+/*
+ * Scene-level schema change commit: update table pointer + insert schema cache.
+ * This is the primary entry-point for add_column.
+ */
+void
+iceberg_meta_commit_schema_change(const MetaCommitSchemaChangeInput *input)
+{
+    bool spi_connected = false;
+
+    if (input == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("input is required")));
+
+    validate_name(input->namespace_name, "namespace_name");
+    validate_name(input->table_name, "table_name");
+    validate_name(input->table_uuid, "table_uuid");
+    validate_name(input->old_metadata_location, "old_metadata_location");
+    validate_name(input->new_metadata_location, "new_metadata_location");
+    validate_name(input->schema_json, "schema_json");
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+
+        iceberg_meta_update_table(input->namespace_name, input->table_name,
+            input->table_uuid, input->old_metadata_location, input->new_metadata_location,
+            0, false,                      /* don't update snapshot_id */
+            input->new_schema_id, true,    /* update schema_id */
+            input->new_last_column_id, true, /* update last_column_id */
+            0, false);                     /* don't update default_spec_id */
+
+        insert_schema_fields(input->table_uuid, input->new_schema_id, input->schema_json);
+
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata commit schema change");
+    }
+    PG_END_TRY();
+}

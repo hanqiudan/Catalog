@@ -183,4 +183,49 @@ void iceberg_meta_rename_table_record(const char *src_ns, const char *src_table,
 void iceberg_meta_drop_table_record(const char *namespace_name,
                                     const char *table_name);
 
+/*
+ * Update table metadata pointers and optional summary fields with optimistic locking.
+ * Uses CAS: WHERE metadata_location = old + table_uuid check.
+ * This is an internal function; SQL functions should use the scene-level
+ * commit wrappers instead.
+ */
+void iceberg_meta_update_table(const char *namespace_name,
+                               const char *table_name,
+                               const char *table_uuid,
+                               const char *old_metadata_location,
+                               const char *new_metadata_location,
+                               int64_t new_snapshot_id,
+                               bool has_new_snapshot_id,
+                               int new_schema_id,
+                               bool has_new_schema_id,
+                               int new_last_column_id,
+                               bool has_new_last_column_id,
+                               int new_default_spec_id,
+                               bool has_new_default_spec_id);
+
+/*
+ * Insert a snapshot summary row into iceberg_catalog.snapshots.
+ * Internal function; does not manage SPI.
+ */
+void iceberg_meta_insert_snapshot(const char *table_uuid,
+                                   int64_t snapshot_id,
+                                   int schema_id,
+                                   bool has_schema_id,
+                                   int64_t timestamp_ms,
+                                   const char *manifest_list,
+                                   int64_t total_records,
+                                   bool has_total_records);
+
+/*
+ * Scene-level commit: update table pointer + insert snapshot row.
+ * This is the primary entry-point for commit_table.
+ */
+void iceberg_meta_commit_table(const MetaCommitTableInput *input);
+
+/*
+ * Scene-level schema change commit: update table pointer + insert schema row.
+ * This is the primary entry-point for add_column.
+ */
+void iceberg_meta_commit_schema_change(const MetaCommitSchemaChangeInput *input);
+
 #endif /* ICEBERG_CATALOG_METADATA_H */
