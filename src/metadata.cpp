@@ -253,6 +253,107 @@ iceberg_meta_table_exists(const char *namespace_name, const char *table_name)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Table lookup                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Look up a table in the local catalog by namespace and table name.
+ * Returns a palloc'd MetaTableInfo if found, or NULL if not found.
+ * The caller must free the result with iceberg_meta_free_table_info().
+ */
+MetaTableInfo *
+iceberg_meta_get_table(const char *namespace_name, const char *table_name)
+{
+    Datum values[2];
+    Oid argtypes[2] = {TEXTOID, TEXTOID};
+    MetaTableInfo *info = NULL;
+    bool spi_connected = false;
+    int rc;
+
+    validate_name(namespace_name, "namespace_name");
+    validate_name(table_name, "table_name");
+
+    values[0] = CStringGetTextDatum(namespace_name);
+    values[1] = CStringGetTextDatum(table_name);
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+
+        rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+            "SELECT "
+            "    relid, namespace, table_name, table_uuid,"
+            "    metadata_location, previous_metadata_location, table_location,"
+            "    last_column_id, current_schema_id, current_snapshot_id, default_spec_id "
+            "FROM iceberg_catalog.tables_internal "
+            "WHERE namespace = $1 "
+            "  AND table_name = $2",
+            2,
+            argtypes,
+            values,
+            NULL,
+            true,
+            1);
+
+        if (rc != SPI_OK_SELECT)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("metadata table lookup query failed")));
+
+        if (SPI_processed > 0)
+        {
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+            HeapTuple row = SPI_tuptable->vals[0];
+            bool isnull;
+
+            info = (MetaTableInfo *) palloc0(sizeof(MetaTableInfo));
+
+            info->relid = DatumGetObjectId(SPI_getbinval(row, tupdesc, 1, &isnull));
+            info->namespace_name = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 2, &isnull)));
+            info->table_name = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 3, &isnull)));
+            info->table_uuid = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 4, &isnull)));
+            info->metadata_location = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 5, &isnull)));
+
+            /* previous_metadata_location is nullable */
+            isnull = true;
+            info->previous_metadata_location = SPI_getvalue(row, tupdesc, 6, &isnull);
+            if (isnull)
+                info->previous_metadata_location = NULL;
+            else
+                info->previous_metadata_location = pstrdup(info->previous_metadata_location);
+
+            info->table_location = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 7, &isnull)));
+
+            info->last_column_id = DatumGetInt32(SPI_getbinval(row, tupdesc, 8, &isnull));
+
+            info->current_schema_id = DatumGetInt32(SPI_getbinval(row, tupdesc, 9, &isnull));
+            info->has_current_schema_id = true;
+
+            /* current_snapshot_id is nullable */
+            info->current_snapshot_id = DatumGetInt64(SPI_getbinval(row, tupdesc, 10, &isnull));
+            info->has_current_snapshot_id = !isnull;
+
+            info->default_spec_id = DatumGetInt32(SPI_getbinval(row, tupdesc, 11, &isnull));
+            info->has_default_spec_id = true;
+        }
+
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        /* Save the original error before SPI cleanup can overwrite it. */
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata table lookup");
+    }
+    PG_END_TRY();
+
+    return info;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Table registration  (transactional, multi-statement)               */
 /* ------------------------------------------------------------------ */
 
