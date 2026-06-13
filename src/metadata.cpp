@@ -43,7 +43,7 @@ validate_name(const char *value, const char *name)
 {
     if (is_empty_string(value))
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("%s is required and must not be empty", name)));
 }
 
@@ -56,7 +56,7 @@ connect_spi(void)
 {
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INTERNAL_ERROR),
+                (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("failed to connect to SPI")));
 }
 
@@ -65,21 +65,21 @@ finish_spi(void)
 {
     if (SPI_finish() != SPI_OK_FINISH)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INTERNAL_ERROR),
+                (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("failed to finish SPI")));
 }
 
 static bool
-is_iceberg_sqlstate(int sqlerrcode)
+is_metadata_sqlstate(int sqlerrcode)
 {
-    return sqlerrcode == ERRCODE_ICEBERG_INVALID_PARAM ||
-           sqlerrcode == ERRCODE_ICEBERG_UNAUTHORIZED ||
-           sqlerrcode == ERRCODE_ICEBERG_FORBIDDEN ||
-           sqlerrcode == ERRCODE_ICEBERG_NOT_FOUND ||
-           sqlerrcode == ERRCODE_ICEBERG_CONFLICT ||
-           sqlerrcode == ERRCODE_ICEBERG_CONSTRAINT_VIOL ||
-           sqlerrcode == ERRCODE_ICEBERG_NOT_SUPPORTED ||
-           sqlerrcode == ERRCODE_ICEBERG_INTERNAL_ERROR;
+    return sqlerrcode == ERRCODE_INVALID_PARAMETER_VALUE ||
+           sqlerrcode == ERRCODE_UNDEFINED_OBJECT ||
+           sqlerrcode == ERRCODE_DUPLICATE_OBJECT ||
+           sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE ||
+           sqlerrcode == ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE ||
+           sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED ||
+           sqlerrcode == ERRCODE_DATA_CORRUPTED ||
+           sqlerrcode == ERRCODE_INTERNAL_ERROR;
 }
 
 static void
@@ -93,8 +93,9 @@ finish_spi_quietly(bool *spi_connected)
 }
 
 /*
- * Re-throw module errors unchanged.  Raw database/SPI errors are normalized
- * to the metadata module's public SQLSTATE contract after SPI has been closed.
+ * Re-throw metadata SQLSTATEs unchanged.  Raw database/SPI errors are
+ * normalized to the metadata module's standard SQLSTATE contract after SPI has
+ * been closed.
  */
 static void
 throw_translated_spi_error(ErrorData *edata, const char *context)
@@ -102,7 +103,7 @@ throw_translated_spi_error(ErrorData *edata, const char *context)
     int sqlerrcode = edata->sqlerrcode;
     char *message;
 
-    if (is_iceberg_sqlstate(sqlerrcode)) {
+    if (is_metadata_sqlstate(sqlerrcode)) {
         FreeErrorData(edata);
         PG_RE_THROW();
     }
@@ -114,17 +115,17 @@ throw_translated_spi_error(ErrorData *edata, const char *context)
 
     if (sqlerrcode == ERRCODE_UNIQUE_VIOLATION)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_CONFLICT),
+                (errcode(ERRCODE_DUPLICATE_OBJECT),
                  errmsg("%s: %s", context, message)));
 
     if (sqlerrcode == ERRCODE_INVALID_TEXT_REPRESENTATION ||
         sqlerrcode == ERRCODE_INVALID_PARAMETER_VALUE)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("%s: %s", context, message)));
 
     ereport(ERROR,
-            (errcode(ERRCODE_ICEBERG_INTERNAL_ERROR),
+            (errcode(ERRCODE_INTERNAL_ERROR),
              errmsg("%s: %s", context, message)));
 }
 
@@ -140,7 +141,7 @@ execute_exists_query(const char *sql, Datum *values, Oid *argtypes)
     rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(sql, 1, argtypes, values, NULL, true, 1);
     if (rc != SPI_OK_SELECT)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INTERNAL_ERROR),
+                (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("metadata exists query failed")));
 
     return SPI_processed > 0;
@@ -232,7 +233,7 @@ iceberg_meta_table_exists(const char *namespace_name, const char *table_name)
             1);
         if (rc != SPI_OK_SELECT)
             ereport(ERROR,
-                    (errcode(ERRCODE_ICEBERG_INTERNAL_ERROR),
+                    (errcode(ERRCODE_INTERNAL_ERROR),
                      errmsg("metadata table exists query failed")));
 
         exists = SPI_processed > 0;
@@ -283,12 +284,12 @@ lock_namespace_for_share(const char *namespace_name)
         1);
     if (rc != SPI_OK_SELECT)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INTERNAL_ERROR),
+                (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("failed to lock namespace metadata")));
 
     if (SPI_processed == 0)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_NOT_FOUND),
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
                  errmsg("namespace not found")));
 }
 
@@ -344,12 +345,12 @@ insert_table_record(const char *namespace_name,
         0);
     if (rc != SPI_OK_INSERT)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INTERNAL_ERROR),
+                (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("failed to insert table metadata")));
 
     if (SPI_processed != 1)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INTERNAL_ERROR),
+                (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("unexpected table metadata insert count")));
 }
 
@@ -363,18 +364,87 @@ insert_table_record(const char *namespace_name,
 static void
 insert_schema_fields(const char *table_uuid, int schema_id, const char *schema_json)
 {
-    Datum values[2];
     Datum insert_values[3];
     Oid argtypes[3] = {TEXTOID, INT4OID, TEXTOID};
     int rc;
 
-    values[0] = CStringGetTextDatum(table_uuid);
-    values[1] = Int32GetDatum(schema_id);
-    insert_values[0] = values[0];
-    insert_values[1] = values[1];
+    insert_values[0] = CStringGetTextDatum(table_uuid);
+    insert_values[1] = Int32GetDatum(schema_id);
     insert_values[2] = CStringGetTextDatum(schema_json);
 
+    /*
+     * Validate before INSERT so a partially invalid schema cannot silently
+     * drop fields and leave table_schemas inconsistent with metadata.json.
+     */
     rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "WITH schema_data AS ("
+        "    SELECT CASE "
+        "        WHEN jsonb_typeof($1::jsonb) = 'object' "
+        "         AND $1::jsonb->>'type' = 'struct' "
+        "         AND jsonb_typeof($1::jsonb->'fields') = 'array' "
+        "        THEN $1::jsonb->'fields' "
+        "        ELSE NULL::jsonb "
+        "    END AS fields"
+        ") "
+        "SELECT "
+        "    fields IS NOT NULL,"
+        "    CASE WHEN fields IS NULL THEN 0 ELSE jsonb_array_length(fields) END::bigint,"
+        "    CASE WHEN fields IS NULL THEN 0 ELSE ("
+        "        SELECT count(*) "
+        "        FROM jsonb_array_elements(fields) AS elems(field_value) "
+        "        WHERE jsonb_typeof(field_value) = 'object' "
+        "          AND field_value ? 'id' "
+        "          AND field_value ? 'name' "
+        "          AND field_value ? 'required' "
+        "          AND field_value ? 'type' "
+        "    ) END::bigint "
+        "FROM schema_data",
+        1,
+        &argtypes[2],
+        &insert_values[2],
+        NULL,
+        true,
+        1);
+    if (rc != SPI_OK_SELECT || SPI_processed != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("failed to validate schema metadata")));
+    else {
+        bool isnull;
+        bool valid_shape = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                                      SPI_tuptable->tupdesc,
+                                                      1,
+                                                      &isnull));
+        int64 total_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+                                                        SPI_tuptable->tupdesc,
+                                                        2,
+                                                        &isnull));
+        int64 valid_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+                                                        SPI_tuptable->tupdesc,
+                                                        3,
+                                                        &isnull));
+
+        if (!valid_shape)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("schema must be a JSON struct with a fields array")));
+        if (total_count != valid_count)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("schema fields must include id, name, required, and type")));
+    }
+
+    /* Use JSON array indexes as field_position; SQL row order is not a contract. */
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "WITH schema_data AS ("
+        "    SELECT $3::jsonb->'fields' AS fields"
+        "), field_items AS ("
+        "    SELECT "
+        "        field_position::int AS field_position,"
+        "        fields->(field_position::int) AS field_value "
+        "    FROM schema_data, "
+        "         generate_series(0, jsonb_array_length(fields) - 1) AS indexes(field_position)"
+        ") "
         "INSERT INTO iceberg_catalog.table_schemas("
         "    table_uuid, schema_id, field_position,"
         "    field_id, field_name, field_required, field_type, field_doc"
@@ -382,7 +452,7 @@ insert_schema_fields(const char *table_uuid, int schema_id, const char *schema_j
         "SELECT "
         "    $1::uuid,"
         "    $2,"
-        "    (row_number() over ())::int - 1,"
+        "    field_position,"
         "    (field_value->>'id')::int,"
         "    field_value->>'name',"
         "    (field_value->>'required')::boolean,"
@@ -392,19 +462,7 @@ insert_schema_fields(const char *table_uuid, int schema_id, const char *schema_j
         "        ELSE (field_value->'type')::text "
         "    END,"
         "    field_value->>'doc' "
-        "FROM jsonb_array_elements("
-        "    CASE "
-        "        WHEN jsonb_typeof($3::jsonb) = 'object' "
-        "         AND $3::jsonb->>'type' = 'struct' "
-        "         AND jsonb_typeof($3::jsonb->'fields') = 'array' "
-        "        THEN $3::jsonb->'fields' "
-        "        ELSE NULL::jsonb "
-        "    END"
-        ") AS fields(field_value) "
-        "WHERE field_value ? 'id' "
-        "  AND field_value ? 'name' "
-        "  AND field_value ? 'required' "
-        "  AND field_value ? 'type' ",
+        "FROM field_items",
         3,
         argtypes,
         insert_values,
@@ -413,7 +471,7 @@ insert_schema_fields(const char *table_uuid, int schema_id, const char *schema_j
         0);
     if (rc != SPI_OK_INSERT)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("failed to insert schema metadata")));
 }
 
@@ -421,9 +479,9 @@ insert_schema_fields(const char *table_uuid, int schema_id, const char *schema_j
  * Expand the partition spec JSON into iceberg_catalog.partition_specs.
  *
  * Accepts three input shapes:
- *   - object with a "fields" array  → object wrapping fields
- *   - object without "fields"       → treated as empty spec (sentinel row)
- *   - bare array                    → used directly as fields list
+ *   - object with a "fields" array  -> object wrapping fields
+ *   - object without "fields"       -> treated as empty spec (sentinel row)
+ *   - bare array                    -> used directly as fields list
  *
  * An unpartitioned spec produces a sentinel row with field_position = -1.
  *
@@ -443,6 +501,73 @@ insert_partition_spec(const char *table_uuid, int spec_id, const char *fields_js
     values[1] = Int32GetDatum(spec_id);
     values[2] = CStringGetTextDatum(json);
 
+    /*
+     * Validate before INSERT so mixed valid/invalid partition fields fail as
+     * one unit instead of storing a truncated partition spec.
+     */
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "WITH spec AS ("
+        "    SELECT CASE "
+        "        WHEN jsonb_typeof($1::jsonb) = 'object' "
+        "         AND jsonb_typeof($1::jsonb->'fields') = 'array' "
+        "        THEN $1::jsonb->'fields' "
+        "        WHEN jsonb_typeof($1::jsonb) = 'object' "
+        "         AND NOT ($1::jsonb ? 'fields') "
+        "        THEN '[]'::jsonb "
+        "        WHEN jsonb_typeof($1::jsonb) = 'array' "
+        "        THEN $1::jsonb "
+        "        ELSE NULL::jsonb "
+        "    END AS fields"
+        ") "
+        "SELECT "
+        "    fields IS NOT NULL,"
+        "    CASE WHEN fields IS NULL THEN 0 ELSE jsonb_array_length(fields) END::bigint,"
+        "    CASE WHEN fields IS NULL THEN 0 ELSE ("
+        "        SELECT count(*) "
+        "        FROM jsonb_array_elements(fields) AS elems(field_value) "
+        "        WHERE jsonb_typeof(field_value) = 'object' "
+        "          AND field_value ? 'field-id' "
+        "          AND field_value ? 'source-id' "
+        "          AND field_value ? 'name' "
+        "          AND field_value ? 'transform' "
+        "    ) END::bigint "
+        "FROM spec",
+        1,
+        &argtypes[2],
+        &values[2],
+        NULL,
+        true,
+        1);
+    if (rc != SPI_OK_SELECT || SPI_processed != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("failed to validate partition spec metadata")));
+    else {
+        bool isnull;
+        bool valid_shape = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                                      SPI_tuptable->tupdesc,
+                                                      1,
+                                                      &isnull));
+        int64 total_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+                                                        SPI_tuptable->tupdesc,
+                                                        2,
+                                                        &isnull));
+        int64 valid_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+                                                        SPI_tuptable->tupdesc,
+                                                        3,
+                                                        &isnull));
+
+        if (!valid_shape)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("partition spec must be a JSON array or object")));
+        if (total_count != valid_count)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("partition fields must include field-id, source-id, name, and transform")));
+    }
+
+    /* Use JSON array indexes as field_position; SQL row order is not a contract. */
     rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
         "WITH spec AS ("
         "    SELECT CASE "
@@ -456,6 +581,12 @@ insert_partition_spec(const char *table_uuid, int spec_id, const char *fields_js
         "        THEN $3::jsonb "
         "        ELSE NULL::jsonb "
         "    END AS fields"
+        "), field_items AS ("
+        "    SELECT "
+        "        field_position::int AS field_position,"
+        "        fields->(field_position::int) AS field_value "
+        "    FROM spec, "
+        "         generate_series(0, jsonb_array_length(fields) - 1) AS indexes(field_position)"
         ") "
         "INSERT INTO iceberg_catalog.partition_specs("
         "    table_uuid, spec_id, field_position,"
@@ -469,7 +600,7 @@ insert_partition_spec(const char *table_uuid, int spec_id, const char *fields_js
         "SELECT "
         "    $1::uuid,"
         "    $2,"
-        "    (row_number() over ())::int - 1,"
+        "    field_position::int,"
         "    (field_value->>'field-id')::int,"
         "    (field_value->>'source-id')::int,"
         "    field_value->>'name',"
@@ -478,12 +609,7 @@ insert_partition_spec(const char *table_uuid, int spec_id, const char *fields_js
         "        THEN field_value->>'transform' "
         "        ELSE (field_value->'transform')::text "
         "    END "
-        "FROM spec, jsonb_array_elements(spec.fields) AS elems(field_value) "
-        "WHERE spec.fields IS NOT NULL "
-        "  AND field_value ? 'field-id' "
-        "  AND field_value ? 'source-id' "
-        "  AND field_value ? 'name' "
-        "  AND field_value ? 'transform' ",
+        "FROM field_items",
         3,
         argtypes,
         values,
@@ -492,12 +618,12 @@ insert_partition_spec(const char *table_uuid, int spec_id, const char *fields_js
         0);
     if (rc != SPI_OK_INSERT)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("failed to insert partition spec metadata")));
 
     if (SPI_processed == 0)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("partition spec must be a JSON array")));
 }
 
@@ -530,33 +656,33 @@ iceberg_meta_register_table(const char *namespace_name,
     validate_name(table_name, "table_name");
     if (input == NULL)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("input is required")));
 
     info = &input->table_info;
     if (!OidIsValid(info->relid))
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("table relid is invalid")));
     validate_name(info->table_uuid, "table_uuid");
     validate_name(info->metadata_location, "metadata_location");
     validate_name(info->table_location, "table_location");
     if (info->previous_metadata_location != NULL)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("previous_metadata_location must be NULL when registering a table")));
     validate_name(input->schema_json, "schema_json");
     if (input->schema_id < 0 || input->spec_id < 0 || info->last_column_id < 0)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("metadata ids must be non-negative")));
     if (!info->has_current_schema_id || info->current_schema_id != input->schema_id)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("current_schema_id must match schema_id")));
     if (!info->has_default_spec_id || info->default_spec_id != input->spec_id)
         ereport(ERROR,
-                (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("default_spec_id must match spec_id")));
 
     PG_TRY();

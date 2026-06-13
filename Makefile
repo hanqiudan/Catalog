@@ -1,7 +1,7 @@
 # Makefile for openGauss extension
 
 MODULE_big = iceberg_catalog
-OBJS = src/iceberg_catalog.o src/table.o src/metadata.o
+OBJS = src/iceberg_catalog.o src/table.o src/metadata.o src/errors.o
 
 EXTENSION = iceberg_catalog
 DATA = iceberg_catalog--1.0.0.sql
