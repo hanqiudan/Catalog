@@ -101,4 +101,26 @@ bool iceberg_meta_namespace_exists(const char *namespace_name);
  */
 bool iceberg_meta_table_exists(const char *namespace_name, const char *table_name);
 
+/*
+ * Register a new Iceberg table in the local metadata tables.
+ *
+ * Within a single SPI transaction this function:
+ *  1. Locks the namespace row for share (prevents concurrent creation races).
+ *  2. Inserts the table head record into tables_internal.
+ *  3. Expands the schema JSON into table_schemas.
+ *  4. Expands the partition spec JSON into partition_specs.
+ *
+ * The caller is responsible for ensuring the namespace exists and the
+ * table name is not already taken.
+ */
+void iceberg_meta_register_table(const char *namespace_name,
+                                 const char *table_name,
+                                 const MetaRegisterTableInput *input);
+
+/*
+ * Free a MetaTableInfo structure and all of its palloc'd string members.
+ * Safe to call with NULL (no-op).
+ */
+void iceberg_meta_free_table_info(MetaTableInfo *info);
+
 #endif /* ICEBERG_CATALOG_METADATA_H */
