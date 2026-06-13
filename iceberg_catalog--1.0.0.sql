@@ -119,13 +119,11 @@ WHERE catalog_name <> current_database()::TEXT;
 
 CREATE OR REPLACE VIEW iceberg_catalog.iceberg_namespace_properties AS
 SELECT
-    n.catalog_name,
-    n.namespace,
-    p.key AS property_key,
-    p.value AS property_value
-FROM iceberg_catalog.namespaces n
-, jsonb_each_text(n.properties) AS p(key, value);
-
+    catalog_name,
+    namespace,
+    (jsonb_each_text(properties)).key AS property_key,
+    (jsonb_each_text(properties)).value AS property_value
+FROM iceberg_catalog.namespaces;
 COMMENT ON SCHEMA iceberg_catalog IS
 'Iceberg catalog metadata managed by the iceberg_catalog extension.';
 
@@ -170,4 +168,23 @@ CREATE OR REPLACE FUNCTION iceberg_catalog.create_table(
 ) RETURNS JSONB
 LANGUAGE C VOLATILE
 AS 'iceberg_catalog', 'iceberg_create_table';
+
+CREATE OR REPLACE FUNCTION iceberg_catalog.commit_table(
+    p_namespace    TEXT,
+    p_table        TEXT,
+    p_requirements JSONB,
+    p_updates      JSONB
+) RETURNS JSONB
+LANGUAGE C VOLATILE
+AS 'iceberg_catalog', 'iceberg_commit_table';
+
+CREATE OR REPLACE FUNCTION iceberg_catalog.add_column(
+    p_namespace    TEXT,
+    p_table        TEXT,
+    p_column_name  TEXT,
+    p_column_type  TEXT,
+    p_column_doc   TEXT DEFAULT NULL
+) RETURNS JSONB
+LANGUAGE C VOLATILE
+AS 'iceberg_catalog', 'iceberg_add_column';
 
