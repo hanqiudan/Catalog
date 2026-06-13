@@ -16,6 +16,7 @@
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "utils/builtins.h"
+#include "lib/stringinfo.h"
 
 #include <string.h>
 
@@ -704,6 +705,127 @@ iceberg_meta_register_table(const char *namespace_name,
         throw_translated_spi_error(edata, "metadata register table");
     }
     PG_END_TRY();
+}
+
+/*
+ * List tables within the given namespace using cursor-based pagination.
+ *
+ * The page_token is the last table_name from the previous page, used as
+ * a keyset cursor: we select rows with table_name > page_token, ordered
+ * ascending, limited to page_size.  If the result set is exactly page_size
+ * rows long there may be more pages, so next-page-token is set to the last
+ * table_name; otherwise it is null.
+ */
+char *
+iceberg_meta_list_tables(const char *namespace_name,
+                         int page_size,
+                         const char *page_token)
+{
+    Datum values[3];
+    Oid argtypes[3] = {TEXTOID, TEXTOID, INT4OID};
+    char nulls[3] = {' ', ' ', ' '};
+    int rc;
+    bool spi_connected = false;
+    char *result = NULL;
+
+    validate_name(namespace_name, "namespace_name");
+
+    if (page_size < 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("page_size must be >= 1")));
+
+    /* Keyset cursor: $2 is the previous page's last table_name, or NULL. */
+    values[0] = CStringGetTextDatum(namespace_name);
+    values[1] = page_token != NULL ? CStringGetTextDatum(page_token) : (Datum) 0;
+    values[2] = Int32GetDatum(page_size);
+    if (page_token == NULL)
+        nulls[1] = 'n';
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+
+        rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+            "SELECT table_name "
+            "FROM iceberg_catalog.tables_internal "
+            "WHERE namespace = $1 "
+            "  AND ($2::text IS NULL OR table_name > $2::text) "
+            "ORDER BY table_name ASC "
+            "LIMIT $3",
+            3,
+            argtypes,
+            values,
+            nulls,
+            true,
+            page_size);
+        if (rc != SPI_OK_SELECT)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("metadata list tables query failed")));
+
+        {
+            StringInfoData buf;
+            initStringInfo(&buf);
+
+            appendStringInfoString(&buf, "{\"identifiers\":[");
+
+            for (uint64 i = 0; i < SPI_processed; i++)
+            {
+                if (i > 0)
+                    appendStringInfoString(&buf, ",");
+
+                char *name = SPI_getvalue(SPI_tuptable->vals[i],
+                                          SPI_tuptable->tupdesc, 1);
+                if (name == NULL)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_CORRUPTED),
+                             errmsg("table_name is NULL in tables_internal")));
+
+                appendStringInfo(&buf,
+                                 "{\"namespace\":[\"%s\"],\"name\":\"%s\"}",
+                                 namespace_name, name);
+                pfree(name);
+            }
+
+            appendStringInfoString(&buf, "],");
+
+            if (SPI_processed >= (uint64) page_size)
+            {
+                char *last_name = SPI_getvalue(
+                    SPI_tuptable->vals[SPI_processed - 1],
+                    SPI_tuptable->tupdesc, 1);
+                if (last_name == NULL)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_CORRUPTED),
+                             errmsg("table_name is NULL in tables_internal")));
+
+                appendStringInfo(&buf, "\"next-page-token\":\"%s\"", last_name);
+                pfree(last_name);
+            }
+            else
+            {
+                appendStringInfoString(&buf, "\"next-page-token\":null");
+            }
+
+            appendStringInfoString(&buf, "}");
+            result = buf.data;
+            /* StringInfoData.data is palloc'd; we transfer ownership to result. */
+        }
+
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata list tables query");
+    }
+    PG_END_TRY();
+
+    return result;
 }
 
 /*

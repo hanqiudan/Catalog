@@ -82,6 +82,19 @@ void iceberg_meta_register_table(const char *namespace_name,
                                  const MetaRegisterTableInput *input);
 
 /*
+ * List tables within the given namespace, with cursor-based pagination.
+ *
+ * Returns a palloc'd JSON string (ListTablesResponse) of the shape:
+ *   {"identifiers":[{"namespace":["ns"],"name":"t1"},...],
+ *    "next-page-token":"..." or null}
+ *
+ * The caller is responsible for pfree()ing the result.
+ */
+char *iceberg_meta_list_tables(const char *namespace_name,
+                               int page_size,
+                               const char *page_token);
+
+/*
  * Free a MetaTableInfo structure and all of its palloc'd string members.
  * Safe to call with NULL (no-op).
  */
