@@ -123,4 +123,25 @@ void iceberg_meta_register_table(const char *namespace_name,
  */
 void iceberg_meta_free_table_info(MetaTableInfo *info);
 
+/*
+ * List tables within the given namespace, with cursor-based pagination.
+ *
+ * Returns a palloc'd JSON string (ListTablesResponse) of the shape:
+ *   {"identifiers":[{"namespace":["ns"],"name":"t1"},...],
+ *    "next-page-token":"..." or null}
+ *
+ * The caller must pfree() the result.
+ */
+char *iceberg_meta_list_tables(const char *namespace_name,
+                               int page_size,
+                               const char *page_token);
+
+/*
+ * Look up a table in the local catalog by namespace and table name.
+ * Returns a palloc'd MetaTableInfo if found, or NULL if no row exists.
+ * The caller must free the result with iceberg_meta_free_table_info().
+ */
+MetaTableInfo *iceberg_meta_get_table(const char *namespace_name,
+                                      const char *table_name);
+
 #endif /* ICEBERG_CATALOG_METADATA_H */

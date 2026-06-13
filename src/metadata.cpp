@@ -728,3 +728,235 @@ iceberg_meta_free_table_info(MetaTableInfo *info)
     pfree(info->table_location);
     pfree(info);
 }
+
+/* ------------------------------------------------------------------ */
+/*  Table lookup (read-only)                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Look up a table in the local catalog by namespace and table name.
+ * Returns a palloc'd MetaTableInfo if found, or NULL if not found.
+ * The caller must free the result with iceberg_meta_free_table_info().
+ */
+MetaTableInfo *
+iceberg_meta_get_table(const char *namespace_name, const char *table_name)
+{
+    Datum values[2];
+    Oid argtypes[2] = {TEXTOID, TEXTOID};
+    MetaTableInfo *info = NULL;
+    bool spi_connected = false;
+    int rc;
+
+    validate_name(namespace_name, "namespace_name");
+    validate_name(table_name, "table_name");
+
+    values[0] = CStringGetTextDatum(namespace_name);
+    values[1] = CStringGetTextDatum(table_name);
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+
+        rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+            "SELECT "
+            "    relid, namespace, table_name, table_uuid,"
+            "    metadata_location, previous_metadata_location, table_location,"
+            "    last_column_id, current_schema_id, current_snapshot_id, default_spec_id "
+            "FROM iceberg_catalog.tables_internal "
+            "WHERE namespace = $1 "
+            "  AND table_name = $2",
+            2,
+            argtypes,
+            values,
+            NULL,
+            true,
+            1);
+
+        if (rc != SPI_OK_SELECT)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("metadata table lookup query failed")));
+
+        if (SPI_processed > 0)
+        {
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+            HeapTuple row = SPI_tuptable->vals[0];
+            bool isnull;
+            char *v;
+
+            info = (MetaTableInfo *) palloc0(sizeof(MetaTableInfo));
+
+            info->relid = DatumGetObjectId(SPI_getbinval(row, tupdesc, 1, &isnull));
+            v = SPI_getvalue(row, tupdesc, 2);
+            info->namespace_name = v ? pstrdup(v) : pstrdup("");
+            v = SPI_getvalue(row, tupdesc, 3);
+            info->table_name = v ? pstrdup(v) : pstrdup("");
+            v = SPI_getvalue(row, tupdesc, 4);
+            info->table_uuid = v ? pstrdup(v) : pstrdup("");
+            v = SPI_getvalue(row, tupdesc, 5);
+            info->metadata_location = v ? pstrdup(v) : pstrdup("");
+
+            /* previous_metadata_location is nullable */
+            v = SPI_getvalue(row, tupdesc, 6);
+            info->previous_metadata_location = v ? pstrdup(v) : NULL;
+
+            v = SPI_getvalue(row, tupdesc, 7);
+            info->table_location = v ? pstrdup(v) : pstrdup("");
+
+            info->last_column_id = DatumGetInt32(SPI_getbinval(row, tupdesc, 8, &isnull));
+
+            info->current_schema_id = DatumGetInt32(SPI_getbinval(row, tupdesc, 9, &isnull));
+            info->has_current_schema_id = true;
+
+            /* current_snapshot_id is nullable */
+            info->current_snapshot_id = DatumGetInt64(SPI_getbinval(row, tupdesc, 10, &isnull));
+            info->has_current_snapshot_id = !isnull;
+
+            info->default_spec_id = DatumGetInt32(SPI_getbinval(row, tupdesc, 11, &isnull));
+            info->has_default_spec_id = true;
+        }
+
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        /* Save the original error before SPI cleanup can overwrite it. */
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata table lookup");
+    }
+    PG_END_TRY();
+
+    return info;
+}
+
+/* ------------------------------------------------------------------ */
+/*  List tables                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * List tables within the given namespace using cursor-based pagination.
+ *
+ * The page_token is the last table_name from the previous page, used as
+ * a keyset cursor: we select rows with table_name > page_token, ordered
+ * ascending, limited to page_size.  If the result set is exactly page_size
+ * rows long there may be more pages, so next-page-token is set to the last
+ * table_name; otherwise it is null.
+ */
+char *
+iceberg_meta_list_tables(const char *namespace_name,
+                         int page_size,
+                         const char *page_token)
+{
+    Datum values[3];
+    Oid argtypes[3] = {TEXTOID, TEXTOID, INT4OID};
+    char nulls[3] = {' ', ' ', ' '};
+    int rc;
+    bool spi_connected = false;
+    char *result = NULL;
+
+    validate_name(namespace_name, "namespace_name");
+
+    if (page_size < 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("page_size must be >= 1")));
+
+    /* Keyset cursor: $2 is the previous page's last table_name, or NULL. */
+    values[0] = CStringGetTextDatum(namespace_name);
+    values[1] = page_token != NULL ? CStringGetTextDatum(page_token) : (Datum) 0;
+    values[2] = Int32GetDatum(page_size);
+    if (page_token == NULL)
+        nulls[1] = 'n';
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+
+        rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+            "SELECT table_name "
+            "FROM iceberg_catalog.tables_internal "
+            "WHERE namespace = $1 "
+            "  AND ($2::text IS NULL OR table_name > $2::text) "
+            "ORDER BY table_name ASC "
+            "LIMIT $3",
+            3,
+            argtypes,
+            values,
+            nulls,
+            true,
+            page_size);
+        if (rc != SPI_OK_SELECT)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("metadata list tables query failed")));
+
+        {
+            StringInfoData buf;
+            uint64 i;
+
+            initStringInfo(&buf);
+
+            appendStringInfoString(&buf, "{\"identifiers\":[");
+
+            for (i = 0; i < SPI_processed; i++)
+            {
+                if (i > 0)
+                    appendStringInfoString(&buf, ",");
+
+                {
+                    char *name = SPI_getvalue(SPI_tuptable->vals[i],
+                                              SPI_tuptable->tupdesc, 1);
+                    if (name == NULL)
+                        ereport(ERROR,
+                                (errcode(ERRCODE_DATA_CORRUPTED),
+                                 errmsg("table_name is NULL in tables_internal")));
+
+                    appendStringInfo(&buf,
+                                     "{\"namespace\":[\"%s\"],\"name\":\"%s\"}",
+                                     namespace_name, name);
+                    pfree(name);
+                }
+            }
+
+            appendStringInfoString(&buf, "],");
+
+            if (SPI_processed >= (uint64) page_size)
+            {
+                char *last_name = SPI_getvalue(
+                    SPI_tuptable->vals[SPI_processed - 1],
+                    SPI_tuptable->tupdesc, 1);
+                if (last_name == NULL)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_CORRUPTED),
+                             errmsg("table_name is NULL in tables_internal")));
+
+                appendStringInfo(&buf, "\"next-page-token\":\"%s\"", last_name);
+                pfree(last_name);
+            }
+            else
+            {
+                appendStringInfoString(&buf, "\"next-page-token\":null");
+            }
+
+            appendStringInfoString(&buf, "}");
+            result = buf.data;
+            /* StringInfoData.data is palloc'd; we transfer ownership to result. */
+        }
+
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata list tables query");
+    }
+    PG_END_TRY();
+
+    return result;
+}
