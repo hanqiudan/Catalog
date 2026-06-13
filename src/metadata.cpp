@@ -306,24 +306,26 @@ iceberg_meta_get_table(const char *namespace_name, const char *table_name)
             TupleDesc tupdesc = SPI_tuptable->tupdesc;
             HeapTuple row = SPI_tuptable->vals[0];
             bool isnull;
+            char *v;
 
             info = (MetaTableInfo *) palloc0(sizeof(MetaTableInfo));
 
             info->relid = DatumGetObjectId(SPI_getbinval(row, tupdesc, 1, &isnull));
-            info->namespace_name = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 2, &isnull)));
-            info->table_name = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 3, &isnull)));
-            info->table_uuid = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 4, &isnull)));
-            info->metadata_location = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 5, &isnull)));
+            v = SPI_getvalue(row, tupdesc, 2);
+            info->namespace_name = v ? pstrdup(v) : pstrdup("");
+            v = SPI_getvalue(row, tupdesc, 3);
+            info->table_name = v ? pstrdup(v) : pstrdup("");
+            v = SPI_getvalue(row, tupdesc, 4);
+            info->table_uuid = v ? pstrdup(v) : pstrdup("");
+            v = SPI_getvalue(row, tupdesc, 5);
+            info->metadata_location = v ? pstrdup(v) : pstrdup("");
 
             /* previous_metadata_location is nullable */
-            isnull = true;
-            info->previous_metadata_location = SPI_getvalue(row, tupdesc, 6, &isnull);
-            if (isnull)
-                info->previous_metadata_location = NULL;
-            else
-                info->previous_metadata_location = pstrdup(info->previous_metadata_location);
+            v = SPI_getvalue(row, tupdesc, 6);
+            info->previous_metadata_location = v ? pstrdup(v) : NULL;
 
-            info->table_location = pstrdup(DatumGetCString(SPI_getvalue(row, tupdesc, 7, &isnull)));
+            v = SPI_getvalue(row, tupdesc, 7);
+            info->table_location = v ? pstrdup(v) : pstrdup("");
 
             info->last_column_id = DatumGetInt32(SPI_getbinval(row, tupdesc, 8, &isnull));
 
