@@ -960,3 +960,454 @@ iceberg_meta_list_tables(const char *namespace_name,
 
     return result;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Internal SPI helpers (assume SPI already connected)                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * SELECT ... FOR UPDATE on a single table row.
+ * Returns a palloc'd MetaTableInfo, or NULL if no matching row exists.
+ * Assumes SPI is already connected.
+ */
+static MetaTableInfo *
+get_table_for_update(const char *namespace_name, const char *table_name)
+{
+    Datum values[2];
+    Oid argtypes[2] = {TEXTOID, TEXTOID};
+    int rc;
+
+    validate_name(namespace_name, "namespace_name");
+    validate_name(table_name, "table_name");
+
+    values[0] = CStringGetTextDatum(namespace_name);
+    values[1] = CStringGetTextDatum(table_name);
+
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "SELECT relid, namespace, table_name, table_uuid,"
+        "       metadata_location, previous_metadata_location, table_location,"
+        "       last_column_id, current_schema_id, current_snapshot_id, default_spec_id "
+        "FROM iceberg_catalog.tables_internal "
+        "WHERE namespace = $1 "
+        "  AND table_name = $2 "
+        "FOR UPDATE",
+        2,
+        argtypes,
+        values,
+        NULL,
+        false,
+        1);
+    if (rc != SPI_OK_SELECT)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("failed to lock table metadata row")));
+
+    if (SPI_processed == 0)
+        return NULL;
+
+    {
+        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        HeapTuple tuple = SPI_tuptable->vals[0];
+        MetaTableInfo *info;
+        char *val;
+        bool isnull;
+
+        info = (MetaTableInfo *) palloc0(sizeof(MetaTableInfo));
+
+        info->relid = DatumGetObjectId(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+
+        val = SPI_getvalue(tuple, tupdesc, 2);
+        info->namespace_name = val ? pstrdup(val) : pstrdup("");
+
+        val = SPI_getvalue(tuple, tupdesc, 3);
+        info->table_name = val ? pstrdup(val) : pstrdup("");
+
+        val = SPI_getvalue(tuple, tupdesc, 4);
+        info->table_uuid = val ? pstrdup(val) : pstrdup("");
+
+        val = SPI_getvalue(tuple, tupdesc, 5);
+        info->metadata_location = val ? pstrdup(val) : pstrdup("");
+
+        val = SPI_getvalue(tuple, tupdesc, 6);
+        info->previous_metadata_location = val ? pstrdup(val) : NULL;
+
+        val = SPI_getvalue(tuple, tupdesc, 7);
+        info->table_location = val ? pstrdup(val) : pstrdup("");
+
+        info->last_column_id = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 8, &isnull));
+
+        info->current_schema_id = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 9, &isnull));
+        info->has_current_schema_id = !isnull;
+
+        info->current_snapshot_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 10, &isnull));
+        info->has_current_snapshot_id = !isnull;
+
+        info->default_spec_id = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 11, &isnull));
+        info->has_default_spec_id = !isnull;
+
+        return info;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Rename table  (internal + public)                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Internal rename implementation.  Assumes SPI is already connected.
+ *
+ * Per design doc section 6.2.15:
+ *   1. Lock the destination namespace (FOR SHARE).
+ *   2. Lock the source table row (FOR UPDATE) and verify it exists.
+ *   3. Verify no table already exists at the destination.
+ *   4. UPDATE the row with the new namespace/table_name.
+ */
+static void
+iceberg_meta_rename_table(const char *src_ns, const char *src_table,
+                          const char *dst_ns, const char *dst_table)
+{
+    Datum values[4];
+    Oid argtypes[4] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID};
+    MetaTableInfo *info;
+    int rc;
+
+    validate_name(src_ns, "src_ns");
+    validate_name(src_table, "src_table");
+    validate_name(dst_ns, "dst_ns");
+    validate_name(dst_table, "dst_table");
+
+    /* 1. Lock the destination namespace (FOR SHARE) */
+    values[0] = CStringGetTextDatum(dst_ns);
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "SELECT 1 "
+        "FROM iceberg_catalog.namespaces "
+        "WHERE catalog_name = current_database()::text "
+        "  AND namespace = $1 "
+        "FOR SHARE",
+        1,
+        argtypes,
+        values,
+        NULL,
+        false,
+        1);
+    if (rc != SPI_OK_SELECT)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("failed to lock destination namespace")));
+    if (SPI_processed == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("destination namespace not found")));
+
+    /* 2. Lock the source table (FOR UPDATE) and confirm it exists */
+    info = get_table_for_update(src_ns, src_table);
+    if (info == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("source table not found")));
+    iceberg_meta_free_table_info(info);
+
+    /* 3. Verify no table already exists at the destination */
+    values[0] = CStringGetTextDatum(dst_ns);
+    values[1] = CStringGetTextDatum(dst_table);
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "SELECT 1 "
+        "FROM iceberg_catalog.tables_internal "
+        "WHERE namespace = $1 "
+        "  AND table_name = $2",
+        2,
+        argtypes,
+        values,
+        NULL,
+        true,
+        1);
+    if (rc != SPI_OK_SELECT)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("failed to check destination table existence")));
+    if (SPI_processed > 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_DUPLICATE_OBJECT),
+                 errmsg("destination table already exists")));
+
+    /* 4. Perform the rename (UPDATE) */
+    values[0] = CStringGetTextDatum(src_ns);
+    values[1] = CStringGetTextDatum(src_table);
+    values[2] = CStringGetTextDatum(dst_ns);
+    values[3] = CStringGetTextDatum(dst_table);
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "UPDATE iceberg_catalog.tables_internal "
+        "SET namespace = $3, table_name = $4 "
+        "WHERE namespace = $1 "
+        "  AND table_name = $2",
+        4,
+        argtypes,
+        values,
+        NULL,
+        false,
+        0);
+    if (rc != SPI_OK_UPDATE)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("failed to rename table metadata")));
+
+    if (SPI_processed == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("source table disappeared during rename")));
+}
+
+/*
+ * Rename a table in the local metadata tables (service wrapper).
+ *
+ * Connects SPI, performs the rename (including preconditions), and
+ * finishes SPI.  Errors are translated via the internal
+ * throw_translated_spi_error pattern.
+ */
+void
+iceberg_meta_rename_table_record(const char *src_ns, const char *src_table,
+                                 const char *dst_ns, const char *dst_table)
+{
+    bool spi_connected = false;
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+        iceberg_meta_rename_table(src_ns, src_table, dst_ns, dst_table);
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata rename table");
+    }
+    PG_END_TRY();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Table deletion  (internal + public)                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Internal: DELETE a table record from iceberg_catalog.tables_internal.
+ *
+ * Raises ERRCODE_UNDEFINED_OBJECT if no row matched.  Assumes SPI is
+ * already connected.
+ */
+static void
+iceberg_meta_delete_table(const char *namespace_name,
+                          const char *table_name)
+{
+    Datum values[2];
+    Oid argtypes[2] = {TEXTOID, TEXTOID};
+    int rc;
+
+    validate_name(namespace_name, "namespace_name");
+    validate_name(table_name, "table_name");
+
+    values[0] = CStringGetTextDatum(namespace_name);
+    values[1] = CStringGetTextDatum(table_name);
+
+    rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+        "DELETE FROM iceberg_catalog.tables_internal "
+        "WHERE namespace = $1 "
+        "  AND table_name = $2",
+        2,
+        argtypes,
+        values,
+        NULL,
+        false,
+        0);
+    if (rc != SPI_OK_DELETE)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("failed to delete table metadata")));
+
+    if (SPI_processed == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("table not found")));
+}
+
+/*
+ * Lock an Iceberg table row for update and return its metadata.
+ *
+ * Service function: manages its own SPI connect/finish.
+ * Raises ERRCODE_UNDEFINED_OBJECT if the table does not exist.
+ */
+MetaTableInfo *
+iceberg_meta_lock_table(const char *namespace_name,
+                        const char *table_name)
+{
+    MetaTableInfo *info = NULL;
+    bool spi_connected = false;
+
+    validate_name(namespace_name, "namespace_name");
+    validate_name(table_name, "table_name");
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+        info = get_table_for_update(namespace_name, table_name);
+        if (info == NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_OBJECT),
+                     errmsg("table not found")));
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata lock table");
+    }
+    PG_END_TRY();
+
+    return info;
+}
+
+/*
+ * Delete the table record from iceberg_catalog.tables_internal.
+ *
+ * Service function: manages its own SPI connect/finish.
+ * Raises ERRCODE_UNDEFINED_OBJECT if no matching row is found.
+ */
+void
+iceberg_meta_drop_table_record(const char *namespace_name,
+                               const char *table_name)
+{
+    bool spi_connected = false;
+
+    validate_name(namespace_name, "namespace_name");
+    validate_name(table_name, "table_name");
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+        iceberg_meta_delete_table(namespace_name, table_name);
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata drop table record");
+    }
+    PG_END_TRY();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Table update / lock operations                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Lock a table row for write-path operations (SELECT ... FOR UPDATE).
+ * Returns a palloc'd MetaTableInfo; caller must free via iceberg_meta_free_table_info.
+ * Returns NULL if the table does not exist.
+ */
+MetaTableInfo*
+iceberg_meta_get_table_for_update(const char *namespace_name, const char *table_name)
+{
+    Datum values[2];
+    Oid argtypes[2] = {TEXTOID, TEXTOID};
+    bool spi_connected = false;
+    int rc;
+    MetaTableInfo *info = NULL;
+
+    validate_name(namespace_name, "namespace_name");
+    validate_name(table_name, "table_name");
+
+    values[0] = CStringGetTextDatum(namespace_name);
+    values[1] = CStringGetTextDatum(table_name);
+
+    PG_TRY();
+    {
+        connect_spi();
+        spi_connected = true;
+
+        rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+            "SELECT relid::oid, namespace, table_name, table_uuid::text,"
+            "       metadata_location, previous_metadata_location, table_location,"
+            "       last_column_id, current_schema_id, current_snapshot_id, default_spec_id "
+            "FROM iceberg_catalog.tables_internal "
+            "WHERE namespace = $1 AND table_name = $2 "
+            "FOR UPDATE",
+            2, argtypes, values, NULL, false, 1);
+
+        if (rc != SPI_OK_SELECT)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("metadata get table for update query failed")));
+
+        if (SPI_processed > 0)
+        {
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+            HeapTuple tuple = SPI_tuptable->vals[0];
+            bool isnull;
+            char *val;
+
+            info = (MetaTableInfo *) palloc0(sizeof(MetaTableInfo));
+
+            /* col 1: relid (oid) */
+            info->relid = DatumGetObjectId(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+
+            /* col 2: namespace */
+            val = SPI_getvalue(tuple, tupdesc, 2);
+            info->namespace_name = val ? pstrdup(val) : pstrdup("");
+
+            /* col 3: table_name */
+            val = SPI_getvalue(tuple, tupdesc, 3);
+            info->table_name = val ? pstrdup(val) : pstrdup("");
+
+            /* col 4: table_uuid::text */
+            val = SPI_getvalue(tuple, tupdesc, 4);
+            info->table_uuid = val ? pstrdup(val) : pstrdup("");
+
+            /* col 5: metadata_location */
+            val = SPI_getvalue(tuple, tupdesc, 5);
+            info->metadata_location = val ? pstrdup(val) : NULL;
+
+            /* col 6: previous_metadata_location */
+            val = SPI_getvalue(tuple, tupdesc, 6);
+            info->previous_metadata_location = val ? pstrdup(val) : NULL;
+
+            /* col 7: table_location */
+            val = SPI_getvalue(tuple, tupdesc, 7);
+            info->table_location = val ? pstrdup(val) : NULL;
+
+            /* col 8: last_column_id */
+            info->last_column_id = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 8, &isnull));
+
+            /* col 9: current_schema_id */
+            info->current_schema_id = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 9, &isnull));
+            info->has_current_schema_id = !isnull;
+
+            /* col 10: current_snapshot_id */
+            info->current_snapshot_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 10, &isnull));
+            info->has_current_snapshot_id = !isnull;
+
+            /* col 11: default_spec_id */
+            info->default_spec_id = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 11, &isnull));
+            info->has_default_spec_id = !isnull;
+        }
+
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata get table for update");
+    }
+    PG_END_TRY();
+
+    return info;
+}

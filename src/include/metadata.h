@@ -144,4 +144,43 @@ char *iceberg_meta_list_tables(const char *namespace_name,
 MetaTableInfo *iceberg_meta_get_table(const char *namespace_name,
                                       const char *table_name);
 
+/*
+ * Lock a table row for write-path operations (SELECT ... FOR UPDATE).
+ * Returns a palloc'd MetaTableInfo; caller must free via iceberg_meta_free_table_info.
+ * Returns NULL if the table does not exist.
+ */
+MetaTableInfo *iceberg_meta_get_table_for_update(const char *namespace_name,
+                                                  const char *table_name);
+
+/*
+ * Lock an Iceberg table row for update and return its metadata.
+ *
+ * This is a service function that manages its own SPI connect/finish.
+ * Returns a palloc'd MetaTableInfo.  Raises ERRCODE_UNDEFINED_OBJECT
+ * (mapped to P0004 Not Found) if no row exists.
+ */
+MetaTableInfo *iceberg_meta_lock_table(const char *namespace_name,
+                                       const char *table_name);
+
+/*
+ * Rename a table in the local metadata tables (service wrapper).
+ *
+ * Connects SPI, validates preconditions (source exists, destination does not),
+ * performs the rename via UPDATE, and finishes SPI.  Errors are translated
+ * via the internal throw_translated_spi_error pattern.
+ */
+void iceberg_meta_rename_table_record(const char *src_ns, const char *src_table,
+                                      const char *dst_ns, const char *dst_table);
+
+/*
+ * Delete the table record from iceberg_catalog.tables_internal.
+ *
+ * This is a service function that manages its own SPI connect/finish.
+ * Raises ERRCODE_UNDEFINED_OBJECT if no matching row is found.
+ * ON DELETE CASCADE on child tables (table_schemas, partition_specs)
+ * cleans up dependent rows automatically.
+ */
+void iceberg_meta_drop_table_record(const char *namespace_name,
+                                    const char *table_name);
+
 #endif /* ICEBERG_CATALOG_METADATA_H */
