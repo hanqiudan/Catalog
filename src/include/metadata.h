@@ -72,6 +72,18 @@ bool iceberg_meta_table_exists(const char *namespace_name, const char *table_nam
 MetaTableInfo *iceberg_meta_get_table(const char *namespace_name, const char *table_name);
 
 /*
+ * List tables in a namespace with last-key cursor pagination.
+ *
+ * page_size must be >= 1.  page_token is NULL or empty for the first page.
+ * Returns a palloc'd JSON string in the caller's memory context.
+ * Raises ERRCODE_INVALID_PARAMETER_VALUE if page_size < 1 or the token is
+ * malformed.  Raises ERRCODE_UNDEFINED_OBJECT if the namespace does not exist.
+ */
+char *iceberg_meta_list_tables(const char *namespace_name,
+                                int page_size,
+                                const char *page_token);
+
+/*
  * Register a new Iceberg table in the local metadata tables.
  *
  * Within a single SPI transaction this function:

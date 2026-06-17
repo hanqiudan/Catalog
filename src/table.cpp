@@ -940,26 +940,24 @@ iceberg_list_tables(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
                  errmsg("p_page_size must be >= 1")));
 
-    /* 3. TODO: Check namespace exists via META */
+    /* 3. List tables via META (namespace existence check is internal) */
 
-    /* TODO:
-     * if (!iceberg_meta_namespace_exists(p_namespace))
-     *     ereport(ERROR,
-     *             (errcode(ERRCODE_ICEBERG_NOT_FOUND),
-     *              errmsg("The given namespace does not exist")));
-     */
+    {
+        char *json_result = NULL;
 
-    /* 4. TODO: List tables via META */
+        PG_TRY();
+        {
+            json_result = iceberg_meta_list_tables(p_namespace, p_page_size, p_page_token);
+        }
+        PG_CATCH();
+        {
+            ErrorData *edata = CopyErrorData();
+            iceberg_err_rethrow_metadata(edata, "list tables");
+        }
+        PG_END_TRY();
 
-    /* TODO:
-     * char *result = iceberg_meta_list_tables(p_namespace, p_page_size, p_page_token);
-     * PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
-     *     CStringGetDatum(result)));
-     * pfree(result);
-     */
-
-    /* 5. Return stub (TODO: replace with real META call) */
-
-    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
-        CStringGetDatum("{\"identifiers\": [], \"next-page-token\": null}")));
+        PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
+            CStringGetDatum(json_result)));
+        pfree(json_result);
+    }
 }
