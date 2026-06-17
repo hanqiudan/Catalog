@@ -184,25 +184,36 @@ iceberg_load_namespace(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_ICEBERG_INVALID_PARAM),
                  errmsg("namespace must not be empty")));
 
-    /* 3. TODO: META GetNamespace
-     *
-     * NamespaceInfo meta_info = iceberg_meta_get_namespace(p_namespace);
-     * if (meta_info == NULL)
-     *     ereport(ERROR,
-     *             (errcode(ERRCODE_ICEBERG_NOT_FOUND),
-     *              errmsg("The given namespace does not exist")));
-     * StringInfo buf = makeStringInfo();
-     * appendStringInfo(buf,
-     *     "{\"namespace\":[\"%s\"],\"properties\":%s}",
-     *     meta_info.namespace_name,
-     *     meta_info.properties);
-     * PG_RETURN_JSONB_P(jsonb_parse(buf->data));
-     */
+    /* 3. META GetNamespace */
+    MetaNamespaceInfo *ns_info = NULL;
 
-    /* 4. Stub: return minimal response.
-     * TODO: Replace with META.GetNamespace() result once META module is available. */
-    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
-        CStringGetDatum("{\"namespace\":[\"TODO\"],\"properties\":{}}")));
+    PG_TRY();
+    {
+        ns_info = iceberg_meta_get_namespace(p_namespace);
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        iceberg_err_rethrow_metadata(edata, "load namespace metadata");
+    }
+    PG_END_TRY();
+
+    if (ns_info == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_ICEBERG_NOT_FOUND),
+                 errmsg("The given namespace does not exist")));
+
+    /* 4. Construct and return response */
+    {
+        StringInfoData buf;
+
+        initStringInfo(&buf);
+        appendStringInfo(&buf,
+            "{\"namespace\":[\"%s\"],\"properties\":%s}",
+            ns_info->namespace_name, ns_info->properties);
+        PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
+            CStringGetDatum(buf.data)));
+    }
 }
 
 

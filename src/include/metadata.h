@@ -113,6 +113,20 @@ void iceberg_meta_rename_table_record(const char *src_ns, const char *src_table,
 void iceberg_meta_free_table_info(MetaTableInfo *info);
 
 /*
+ * MetaNamespaceInfo -- lightweight struct for namespace metadata.
+ */
+typedef struct MetaNamespaceInfo {
+    char *namespace_name;
+    char *properties;
+} MetaNamespaceInfo;
+
+/*
+ * Read namespace metadata. Returns a palloc'd MetaNamespaceInfo,
+ * or NULL if the namespace does not exist.
+ */
+MetaNamespaceInfo* iceberg_meta_get_namespace(const char *namespace_name);
+
+/*
  * Create a namespace in the local catalog.
  *
  * Validates the namespace name and properties JSON, then inserts a row

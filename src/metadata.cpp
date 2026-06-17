@@ -1077,3 +1077,71 @@ iceberg_meta_create_namespace(const char *namespace_name,
     }
     PG_END_TRY();
 }
+
+/* ------------------------------------------------------------------ */
+/*  Namespace read                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Read namespace metadata. Returns a palloc'd MetaNamespaceInfo,
+ * or NULL if the namespace does not exist.
+ */
+MetaNamespaceInfo*
+iceberg_meta_get_namespace(const char *namespace_name)
+{
+    Datum values[1];
+    Oid argtypes[1] = {TEXTOID};
+    MetaNamespaceInfo *result = NULL;
+    bool spi_connected = false;
+
+    validate_name(namespace_name, "namespace_name");
+
+    values[0] = CStringGetTextDatum(namespace_name);
+
+    PG_TRY();
+    {
+        int rc;
+
+        connect_spi();
+        spi_connected = true;
+
+        rc = ICEBERG_SPI_EXECUTE_WITH_ARGS(
+            "SELECT namespace, properties::text "
+            "FROM iceberg_catalog.namespaces "
+            "WHERE catalog_name = current_database()::text "
+            "  AND namespace = $1",
+            1, argtypes, values, NULL, true, 1);
+
+        if (rc != SPI_OK_SELECT)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("metadata get namespace query failed")));
+
+        if (SPI_processed > 0)
+        {
+            HeapTuple tuple = SPI_tuptable->vals[0];
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+            char *val;
+
+            result = (MetaNamespaceInfo *) palloc0(sizeof(MetaNamespaceInfo));
+
+            val = SPI_getvalue(tuple, tupdesc, 1);
+            result->namespace_name = val ? pstrdup(val) : pstrdup("");
+
+            val = SPI_getvalue(tuple, tupdesc, 2);
+            result->properties = val ? pstrdup(val) : pstrdup("{}");
+        }
+
+        finish_spi();
+        spi_connected = false;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata = CopyErrorData();
+        finish_spi_quietly(&spi_connected);
+        throw_translated_spi_error(edata, "metadata get namespace");
+    }
+    PG_END_TRY();
+
+    return result;
+}
