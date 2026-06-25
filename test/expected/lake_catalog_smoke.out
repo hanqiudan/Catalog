@@ -1,0 +1,41 @@
+BEGIN
+CREATE FUNCTION
+ create_namespace 
+------------------
+ 
+(1 row)
+
+         check_name         | passed 
+----------------------------+--------
+ missing_namespace_defaults | t
+ namespace_created          | t
+(2 rows)
+
+ register_lake_table 
+---------------------
+ 
+(1 row)
+
+             check_name              | passed 
+-------------------------------------+--------
+ drop_non_empty_namespace_rejected   | t
+ register_missing_namespace_rejected | t
+ table_registered                    | t
+(3 rows)
+
+ clean_table_meta 
+------------------
+ 
+(1 row)
+
+ drop_namespace 
+----------------
+ 
+(1 row)
+
+    check_name     | passed 
+-------------------+--------
+ namespace_dropped | t
+(1 row)
+
+ROLLBACK

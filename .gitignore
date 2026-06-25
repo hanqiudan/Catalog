@@ -6,6 +6,7 @@
 
 # Compiled executables
 *.out
+!test/expected/*.out
 *.exe
 
 # Dependency directories
